@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local AI Security Log Analyzer</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2330; --mute:#667085; --line:#e4e7ec; --accent:#2f5bea;
+          --crit:#b42318; --high:#d9480f; --med:#b7791f; --low:#3b7c4a; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  header { padding:18px 28px; background:var(--card); border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; }
+  main { max-width:1150px; margin:20px auto; padding:0 20px; display:grid; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
+  h2 { font-size:15px; margin:0 0 10px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:7px; padding:8px 14px; font-weight:600; cursor:pointer; }
+  button.ghost { background:#fff; color:var(--ink); border:1px solid var(--line); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .pill { font-size:12px; padding:2px 9px; border-radius:99px; background:#eef1f6; color:var(--mute); }
+  .ok { background:#e7f6ec; color:#1f7a3d; } .bad { background:#fdecea; color:var(--crit); }
+  .bar { height:10px; background:#eef1f6; border-radius:99px; overflow:hidden; flex:1; min-width:200px; }
+  .bar > div { height:100%; background:var(--accent); width:0; transition:width .4s; }
+  .parts { display:flex; flex-wrap:wrap; gap:3px; margin-top:10px; }
+  .parts span { width:16px; height:16px; border-radius:3px; background:#e4e7ec; }
+  .parts .done { background:#4caf6e; } .parts .failed { background:var(--crit); } .parts .cur { background:var(--accent); }
+  pre.log { background:#0f1420; color:#cfd6e4; padding:10px; border-radius:8px; max-height:190px; overflow:auto; font-size:12px; margin:10px 0 0; white-space:pre-wrap; }
+  .counts { display:flex; gap:10px; flex-wrap:wrap; margin:6px 0 12px; }
+  .count { padding:8px 14px; border-radius:8px; border:1px solid var(--line); min-width:90px; }
+  .count b { font-size:20px; display:block; }
+  .sev { font-weight:700; font-size:12px; padding:2px 8px; border-radius:5px; color:#fff; }
+  .Critical { background:var(--crit); } .High { background:var(--high); } .Medium { background:var(--med); } .Low { background:var(--low); }
+  .finding { border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin-top:10px; }
+  .finding h3 { margin:0; font-size:14px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .meta { color:var(--mute); font-size:12px; }
+  .ev { font:12px ui-monospace,Menlo,Consolas,monospace; background:#f6f7f9; border-radius:6px; padding:6px 8px; margin-top:6px; overflow-x:auto; white-space:pre; }
+  .muted { color:var(--mute); }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  td, th { text-align:left; padding:4px 8px; border-bottom:1px solid var(--line); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔐 Local AI Security Log Analyzer</h1>
+  <div class="row">
+    <span id="modelPill" class="pill">model: checking…</span>
+    <span id="ramPill" class="pill">RAM: –</span>
+  </div>
+</header>
+<main>
+  <section class="card">
+    <h2>1. Upload a log file</h2>
+    <div class="row">
+      <input type="file" id="file" accept=".log,.txt">
+      <button id="uploadBtn">Upload</button>
+      <span id="uploadMsg" class="muted"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>2. Analyse</h2>
+    <div class="row">
+      <button id="startBtn" disabled>Start analysis</button>
+      <button id="cancelBtn" class="ghost" disabled>Cancel</button>
+      <span id="statusPill" class="pill">no job</span>
+      <div class="bar"><div id="barFill"></div></div>
+      <span id="progressTxt" class="muted"></span>
+    </div>
+    <div id="parts" class="parts"></div>
+    <div id="budget" class="meta" style="margin-top:8px"></div>
+    <pre id="log" class="log">Waiting…</pre>
+  </section>
+
+  <section class="card" id="reportCard" hidden>
+    <h2>3. Final report <a id="jsonLink" class="meta" target="_blank" style="margin-left:8px">download JSON</a></h2>
+    <p id="summary"></p>
+    <div id="counts" class="counts"></div>
+    <div id="chains"></div>
+    <div id="findings"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let jobId = localStorage.getItem("jobId") || null, timer = null;
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.detail || r.statusText);
+  return body;
+}
+
+async function system() {
+  try {
+    const s = await api("/api/system");
+    $("modelPill").textContent = s.model_server.ok ? `model: ${s.model} (ctx ${s.ctx_limit})` : "model server offline";
+    $("modelPill").className = "pill " + (s.model_server.ok ? "ok" : "bad");
+    if (s.ram_mb) $("ramPill").textContent = `RAM: ${s.ram_mb.total} MB / ${s.ram_mb.limit} MB (model ${s.ram_mb.model_server}, backend ${s.ram_mb.backend})`;
+  } catch (e) { $("modelPill").textContent = "backend offline"; }
+}
+
+$("uploadBtn").onclick = async () => {
+  const f = $("file").files[0];
+  if (!f) return $("uploadMsg").textContent = "Choose a .log or .txt file first.";
+  const fd = new FormData(); fd.append("file", f);
+  $("uploadMsg").textContent = "Uploading…";
+  try {
+    const r = await api("/api/upload", { method: "POST", body: fd });
+    jobId = r.job_id; localStorage.setItem("jobId", jobId);
+    $("uploadMsg").textContent = `Uploaded ${f.name} (${(r.bytes/1024).toFixed(1)} KB).`;
+    $("reportCard").hidden = true; poll();
+  } catch (e) { $("uploadMsg").textContent = "❌ " + e.message; }
+};
+
+$("startBtn").onclick = async () => {
+  try { await api(`/api/jobs/${jobId}/start`, { method: "POST" }); poll(); }
+  catch (e) { alertBox(e.message); }
+};
+$("cancelBtn").onclick = () => api(`/api/jobs/${jobId}/cancel`, { method: "POST" });
+function alertBox(msg) { $("log").textContent = "❌ " + msg + "\n" + $("log").textContent; }
+
+async function poll() {
+  clearTimeout(timer);
+  if (!jobId) return;
+  let j;
+  try { j = await api(`/api/jobs/${jobId}`); }
+  catch (e) { localStorage.removeItem("jobId"); jobId = null; return; }
+  const busy = ["queued","planning","running","reporting"].includes(j.status);
+  $("statusPill").textContent = j.status;
+  $("startBtn").disabled = busy;
+  $("startBtn").textContent = j.progress.total && !busy && j.status !== "uploaded" ? "Resume / retry failed parts" : "Start analysis";
+  $("cancelBtn").disabled = !busy;
+  const p = j.progress, pct = p.total ? Math.round(100 * p.done / p.total) : 0;
+  $("barFill").style.width = pct + "%";
+  $("progressTxt").textContent = p.total ? `${p.done}/${p.total} parts${p.failed ? `, ${p.failed} failed` : ""}` : "";
+  const firstPending = j.chunks.findIndex(c => c.status === "pending");
+  $("parts").innerHTML = j.chunks.map((c, i) =>
+    `<span class="${c.status === "done" ? "done" : c.status === "failed" ? "failed" : (busy && i === firstPending ? "cur" : "")}"
+      title="Part ${i+1}: L${c.start}-L${c.end}, ${c.tokens} tokens, ${c.status}${c.timing ? ", " + c.timing.seconds + "s" : ""}${c.error ? ", " + esc(c.error) : ""}"></span>`).join("");
+  const b = j.stats && j.stats.budget;
+  $("budget").textContent = b ? `Token budget per call: context ${b.context} = prompt ${b.base_prompt} + carried facts ≤${b.carry} + log ≤${b.log_per_part} + reply ≤${b.output_reserve} + margin ${b.safety}. File: ${j.stats.lines} lines, ${j.stats.total_tokens} tokens.` : "";
+  $("log").textContent = (j.log || []).slice().reverse().join("\n") || "Ready. Click Start analysis.";
+  if (j.report) renderReport(j.report);
+  if (busy) timer = setTimeout(poll, 1500);
+}
+
+function renderReport(r) {
+  $("reportCard").hidden = false;
+  $("jsonLink").href = `/api/jobs/${jobId}/report`;
+  $("summary").textContent = r.summary + (r.note ? " ⚠ " + r.note : "");
+  $("counts").innerHTML = Object.entries(r.counts).reverse().map(([k, v]) =>
+    `<div class="count"><span class="sev ${k}">${k}</span><b>${v}</b></div>`).join("");
+  $("chains").innerHTML = r.model_chains && r.model_chains.length ? `<h2>Attack chains noted by the model</h2><table><tr><th>Severity</th><th>Source</th><th>Type</th><th>Reason</th></tr>${
+    r.model_chains.map(c => `<tr><td><span class="sev ${esc(c.severity)}">${esc(c.severity)}</span></td><td>${esc(c.source)}</td><td>${esc(c.attack_type)}</td><td>${esc(c.reason)}</td></tr>`).join("")}</table>` : "";
+  $("findings").innerHTML = r.findings.length ? r.findings.map(f => `
+    <div class="finding">
+      <h3><span class="sev ${f.severity}">${f.severity}</span>${esc(f.attack_type)} <span class="pill">${esc(f.source)}</span>
+        ${f.cross_part ? `<span class="pill">linked across parts ${f.parts.join(", ")}</span>` : ""}
+        ${f.verified_in_log ? "" : `<span class="pill bad">source not found in cited lines</span>`}</h3>
+      <div class="meta">Lines: ${f.evidence_lines.length > 20 ? f.evidence_lines.slice(0,20).join(", ") + ` … (+${f.evidence_lines.length-20})` : f.evidence_lines.join(", ")}</div>
+      <div><b>Reason:</b> ${esc(f.reason)}</div>
+      <div><b>Suggested action:</b> ${esc(f.suggested_action)}</div>
+      <div class="ev">${f.evidence.map(e => `L${e.line}: ${esc(e.text)}`).join("\n")}</div>
+    </div>`).join("") : "<p class='muted'>No findings with supporting evidence.</p>";
+}
+
+system(); setInterval(system, 5000); poll();
+</script>
+</body>
+</html>
