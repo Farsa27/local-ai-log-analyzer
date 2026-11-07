@@ -264,8 +264,64 @@ def analyse_chunk(job: dict, c: dict, path: Path) -> None:
              + (" (JSON repaired)" if repaired else ""))
 
 
+LOGIN = re.compile(r"login|signin|/auth|sshd|password", re.I)
+LOGIN_FAIL = re.compile(r"\b401\b|invalid|fail|denied|wrong", re.I)
+LOGIN_OK = re.compile(r"auth_result=success|Accepted password|login success", re.I)
+PROBE = re.compile(r"/\.env|/\.git|wp-admin|phpmyadmin|/backup|\.sql\b|server-status|/actuator|config\.json", re.I)
+TRAVERSAL = re.compile(r"\.\./|\.\.\\")
+SQLI = re.compile(r"('|%27)\s*(or|and)\s+\d=\d|union\s+select|sleep\(|;\s*select|--\s*$", re.I)
+RATE = re.compile(r"requests_in_window=\d+|\b429\b")
+STATUS = re.compile(r"\s(\d{3})(\s|$)")
+
+
+def evidence_type(model_type: str, text: str) -> str:
+    """Correct the model's label using what the cited line actually shows.
+    Small models often call a failed login 'unauthorized_access'; the evidence decides."""
+    if LOGIN.search(text):
+        if LOGIN_OK.search(text):
+            return "successful_login"
+        if LOGIN_FAIL.search(text):
+            return "failed_login"
+    if SQLI.search(text):
+        return "sql_injection"
+    if TRAVERSAL.search(text):
+        return "path_traversal"
+    if PROBE.search(text):
+        return "scanning"
+    if RATE.search(text):
+        return "high_request_rate"
+    return model_type
+
+
+def is_server_error_only(lines: list[int], line_map: dict[int, str]) -> bool:
+    codes = [STATUS.search(line_map[n]) for n in lines]
+    return bool(codes) and all(m and m.group(1).startswith("5") for m in codes)
+
+
 def validate_events(raw_events, c: dict, line_map: dict[int, str]) -> list[dict]:
-    """Drop hallucinated line numbers and check the source really appears in the cited lines."""
+    """Drop hallucinated line numbers, keep only lines that mention the source,
+    correct event types from the evidence, and merge per (source, type)."""
+    grouped: dict[tuple, dict] = {}
+    for ev in _validate_raw(raw_events, line_map):
+        src_known = ev["source"] != "unknown"
+        lines = [n for n in ev["lines"] if not src_known or ev["source"] in line_map[n]] or ev["lines"]
+        for n in lines:
+            etype = evidence_type(ev["type"], line_map[n])
+            key = (ev["source"], etype)
+            g = grouped.setdefault(key, {**ev, "type": etype, "lines": []})
+            g["lines"].append(n)
+            if SEV_RANK[ev["severity"]] > SEV_RANK[g["severity"]]:
+                g["severity"] = ev["severity"]
+    out = []
+    for g in grouped.values():
+        g["lines"] = sorted(set(g["lines"]))
+        if g["type"] == "high_request_rate" and is_server_error_only(g["lines"], line_map):
+            continue  # 5xx outage errors (e.g. during a deployment) are not an attack by themselves
+        out.append(g)
+    return out
+
+
+def _validate_raw(raw_events, line_map: dict[int, str]) -> list[dict]:
     out = []
     if not isinstance(raw_events, list):
         return out
@@ -363,6 +419,8 @@ def build_report(job: dict, path: Path) -> dict:
     for (src, typ), m in merged.items():
         if (src, typ) in used or typ == "successful_login":
             continue  # a normal successful login alone is not an attack
+        if any(f["source"] == src and set(m["lines"]) <= set(f["evidence_lines"]) for f in findings):
+            continue  # already part of an attack-chain finding for this source
         sev = m["severity"]
         if typ == "failed_login":
             if m["count"] < 3:
