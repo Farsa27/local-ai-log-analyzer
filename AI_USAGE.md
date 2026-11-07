@@ -75,4 +75,13 @@ that is left. Details are in the README.
    `workspace.admin` from 203.0.113.44 (L5–L189 failures, L196 success, L198/L201 admin access + export),
    SQL injection from 203.0.113.72, scanning + path traversal from 203.0.113.90, request flood from 203.0.113.155,
    and a prompt-injection string at L217 that the app must not obey.
-7. _(add what the real model got right or wrong in your run)_
+7. **First real run (Qwen3.5-2B)**: 15 parts, ~27 s each, 2.0 GB RAM. It found the SQL injection (High, linked
+   across parts 2 and 13) but **missed the brute-force → compromise chain**: the model labelled most failed logins
+   and the successful login as `unauthorized_access`, so the cross-part rule never fired. It also flagged deployment
+   503 errors as an "unusual request rate", attached lines from other IPs to a finding, and missed the request flood.
+   **Fixes:** (a) each cited line is checked to contain the source, otherwise it is dropped; (b) the event type is
+   corrected from the line's own evidence (401/invalid_password on a login path = failed_login, auth_result=success =
+   successful_login, `../` = path_traversal, probe paths = scanning, 429/requests_in_window = rate); (c) a "rate"
+   finding made only of 5xx server errors is dropped; (d) the prompt now gives these exact cues; (e) findings already
+   inside an attack chain are not repeated. After the fix the report shows the Critical brute-force → compromise chain
+   (L5–L189 → L196 → admin access L198 and export L201).
